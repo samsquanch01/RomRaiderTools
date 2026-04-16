@@ -10,7 +10,9 @@ function Write-Log {
     param([string]$Message)
 
     $LogDir = Join-Path $HOME ".RomRaider"
-    if (!(Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
+    if (!(Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir | Out-Null
+    }
 
     $LogFile = Join-Path $LogDir "module_$(Get-Date -Format yyyyMMdd).log"
     Add-Content -Path $LogFile -Value ("[{0}] {1}" -f (Get-Date -Format "HH:mm:ss"), $Message)
@@ -22,7 +24,7 @@ function Write-Log {
 function Detect-DefinitionType {
     param([string]$XmlPath)
 
-    $Name = Split-Path $XmlPath -Leaf
+    $Name    = Split-Path $XmlPath -Leaf
     $Content = Get-Content $XmlPath -Raw
 
     if ($Name -match "ecu" -or $Content -match "<rom>" -or $Content -match "<ecu") { return "ecu" }
@@ -38,26 +40,24 @@ function Detect-DefinitionType {
 function Detect-DefinitionMode {
     param([string]$XmlPath)
 
-    $Name = Split-Path $XmlPath -Leaf
+    $Name    = Split-Path $XmlPath -Leaf
+    $Folder  = Split-Path $XmlPath -Parent
     $Content = Get-Content $XmlPath -Raw
 
-    if ($Name -match "metric" -or $Content -match "metric") { return "metric" }
-    if ($Name -match "standard" -or $Content -match "standard") { return "standard" }
+    # 1. Filename-based detection
+    if ($Name -match 'metric')   { return 'metric' }
+    if ($Name -match 'standard') { return 'standard' }
 
+    # 2. Content-based detection
+    if ($Content -match 'metric')   { return 'metric' }
+    if ($Content -match 'standard') { return 'standard' }
+
+    # 3. Folder-based detection (handles "subaru metric", "metric", etc.)
+    if ($Folder -match '(?i)metric')   { return 'metric' }
+    if ($Folder -match '(?i)standard') { return 'standard' }
+
+    # 4. No detection possible
     return $null
-}
-
-# ------------------------------------------------------------
-# Shared: Canonical filename
-# ------------------------------------------------------------
-function Get-CanonicalName {
-    param([string]$Type)
-
-    switch ($Type) {
-        "ecu"    { return "ecu_defs.xml" }
-        "logger" { return "logger_defs.xml" }
-        "dyno"   { return "dyno_defs.xml" }
-    }
 }
 
 # ------------------------------------------------------------
@@ -69,49 +69,171 @@ function Place-Definition {
         [Parameter(Mandatory=$true)]
         [string]$XmlPath,
 
-        [switch]$Force
+        [switch]$Force,
+        [switch]$DryRun,
+        [switch]$SkipExisting
     )
 
     if (-not (Test-Path $XmlPath)) {
         Write-Host "File not found: $XmlPath"
-        return
+        Write-Log "Place-Definition: File not found: $XmlPath"
+        return [pscustomobject]@{
+            Path         = $XmlPath
+            Status       = 'Missing'
+            Type         = $null
+            Mode         = $null
+            DestFile     = $null
+            Skipped      = $true
+            Reason       = 'Source file not found'
+            Dependencies = @()
+        }
     }
 
     $Type = Detect-DefinitionType $XmlPath
     if (-not $Type) {
-        Write-Host "Unknown definition type."
-        return
+        Write-Host "Unknown definition type for: $XmlPath"
+        Write-Log "Place-Definition: Unknown type for $XmlPath"
+        return [pscustomobject]@{
+            Path         = $XmlPath
+            Status       = 'UnknownType'
+            Type         = $null
+            Mode         = $null
+            DestFile     = $null
+            Skipped      = $true
+            Reason       = 'Unknown definition type'
+            Dependencies = @()
+        }
     }
 
-    $Mode = Detect-DefinitionMode $XmlPath
-    if (-not $Mode) {
-        Write-Host "Unable to detect mode."
-        Write-Host "1) Standard"
-        Write-Host "2) Metric"
-        $choice = Read-Host "Select mode"
-        if ($choice -eq "1") { $Mode = "standard" }
-        elseif ($choice -eq "2") { $Mode = "metric" }
-        else { return }
+    $Mode = $null
+    if ($Type -ne 'dyno') {
+        $Mode = Detect-DefinitionMode $XmlPath
+        if (-not $Mode) {
+            Write-Host "Unable to detect mode for: $XmlPath"
+            Write-Host "1) Standard"
+            Write-Host "2) Metric"
+            $choice = Read-Host "Select mode"
+            if     ($choice -eq "1") { $Mode = "standard" }
+            elseif ($choice -eq "2") { $Mode = "metric" }
+            else {
+                Write-Log "Place-Definition: Mode selection aborted for $XmlPath"
+                return [pscustomobject]@{
+                    Path         = $XmlPath
+                    Status       = 'ModeUndetected'
+                    Type         = $Type
+                    Mode         = $null
+                    DestFile     = $null
+                    Skipped      = $true
+                    Reason       = 'Mode not detected / user aborted'
+                    Dependencies = @()
+                }
+            }
+        }
     }
 
-    $DestName = Get-CanonicalName $Type
+    # Base + destination directory
     $Base = Join-Path $PSScriptRoot "..\..\definitions"
-    $DestDir = Join-Path $Base "$Type\$Mode"
-
-    if (!(Test-Path $DestDir)) {
-        New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+    if ($Type -eq 'dyno') {
+        $DestDir = Join-Path $Base $Type
+    } else {
+        $DestDir = Join-Path $Base "$Type\$Mode"
     }
 
-    $DestFile = Join-Path $DestDir $DestName
+    if (-not (Test-Path $DestDir)) {
+        if ($DryRun) {
+            Write-Host "[DRY-RUN] Would create directory: $DestDir"
+            Write-Log  "DRY-RUN: Would create directory $DestDir"
+        } else {
+            New-Item -ItemType Directory -Path $DestDir -Force | Out-Null
+            Write-Log "Created directory: $DestDir"
+        }
+    }
 
-    if ((Test-Path $DestFile) -and -not $Force) {
-        $ow = Read-Host "Overwrite $DestFile? (y/n)"
-        if ($ow -ne "y") { return }
+    # Collision-proof destination naming: start with original filename
+    $BaseName = Split-Path $XmlPath -Leaf
+    $DestFile = Join-Path $DestDir $BaseName
+
+    if (Test-Path $DestFile) {
+        if ($SkipExisting -and -not $Force) {
+            Write-Host "Skipping existing: $DestFile"
+            Write-Log  "Skipping existing (SkipExisting): $DestFile"
+            $deps = @()
+            try {
+                $deps = Get-DefinitionDependencyMap -Path $XmlPath -ErrorAction SilentlyContinue
+            } catch { }
+
+            return [pscustomobject]@{
+                Path         = $XmlPath
+                Status       = 'SkippedExisting'
+                Type         = $Type
+                Mode         = $Mode
+                DestFile     = $DestFile
+                Skipped      = $true
+                Reason       = 'SkipExisting set and destination exists'
+                Dependencies = $deps
+            }
+        }
+
+        if (-not $Force) {
+            # Collision-proof: increment suffix until free
+            $name    = [System.IO.Path]::GetFileNameWithoutExtension($BaseName)
+            $ext     = [System.IO.Path]::GetExtension($BaseName)
+            $index   = 1
+            $newDest = $DestFile
+
+            while (Test-Path $newDest) {
+                $newDest = Join-Path $DestDir ("{0}_{1}{2}" -f $name, $index, $ext)
+                $index++
+            }
+
+            Write-Host "Collision detected for $DestFile"
+            Write-Host "Using: $newDest"
+            Write-Log  "Collision: $DestFile -> using $newDest"
+            $DestFile = $newDest
+        }
+        elseif ($Force) {
+            Write-Host "Overwriting: $DestFile"
+            Write-Log  "Overwriting existing: $DestFile (Force)"
+        }
+    }
+
+    # Dependency mapping (best-effort, per-file)
+    $Dependencies = @()
+    try {
+        $Dependencies = Get-DefinitionDependencyMap -Path $XmlPath -ErrorAction Stop
+    } catch {
+        Write-Log ("Place-Definition: Dependency mapping failed for {0}: {1}" -f $XmlPath, $_.Exception.Message)
+    }
+
+    if ($DryRun) {
+        Write-Host "[DRY-RUN] Would copy: $XmlPath -> $DestFile"
+        Write-Log  "DRY-RUN: Would place $XmlPath -> $DestFile"
+        return [pscustomobject]@{
+            Path         = $XmlPath
+            Status       = 'DryRun'
+            Type         = $Type
+            Mode         = $Mode
+            DestFile     = $DestFile
+            Skipped      = $false
+            Reason       = 'Dry-run only'
+            Dependencies = $Dependencies
+        }
     }
 
     Copy-Item $XmlPath $DestFile -Force
     Write-Host "Placed: $DestFile"
-    Write-Log "Placed $XmlPath → $DestFile"
+    Write-Log  "Placed $XmlPath -> $DestFile"
+
+    return [pscustomobject]@{
+        Path         = $XmlPath
+        Status       = 'Placed'
+        Type         = $Type
+        Mode         = $Mode
+        DestFile     = $DestFile
+        Skipped      = $false
+        Reason       = $null
+        Dependencies = $Dependencies
+    }
 }
 
 # ------------------------------------------------------------
@@ -123,22 +245,78 @@ function Bulk-PlaceDefinitions {
         [Parameter(Mandatory=$true)]
         [string]$SourceDir,
 
-        [switch]$Force
+        [switch]$Force,
+        [switch]$DryRun,
+        [switch]$SkipExisting,
+        [switch]$Summary
     )
 
     if (-not (Test-Path $SourceDir)) {
         Write-Host "Directory not found: $SourceDir"
+        Write-Log  "Bulk-PlaceDefinitions: Directory not found: $SourceDir"
         return
     }
 
     $Files = Get-ChildItem -Path $SourceDir -Filter *.xml -Recurse
+    if (-not $Files) {
+        Write-Host "No XML files found in: $SourceDir"
+        Write-Log  "Bulk-PlaceDefinitions: No XML files in $SourceDir"
+        return
+    }
+
+    Write-Host "Found $($Files.Count) XML files under $SourceDir"
+    Write-Log  "Bulk-PlaceDefinitions: Found $($Files.Count) XML files under $SourceDir"
+
+    $results = @()
 
     foreach ($file in $Files) {
         Write-Host "Processing: $($file.FullName)"
-        Place-Definition -XmlPath $file.FullName @($Force)
+        Write-Log  "Processing: $($file.FullName)"
+
+        $result = Place-Definition -XmlPath $file.FullName -Force:$Force -DryRun:$DryRun -SkipExisting:$SkipExisting
+        if ($null -ne $result) {
+            $results += $result
+        }
     }
 
     Write-Host "Bulk import complete."
+    Write-Log  "Bulk-PlaceDefinitions: Completed for $SourceDir"
+
+    if ($Summary) {
+        $total   = $results.Count
+        $placed  = ($results | Where-Object { $_.Status -eq 'Placed' }).Count
+        $dry     = ($results | Where-Object { $_.Status -eq 'DryRun' }).Count
+        $skipped = ($results | Where-Object { $_.Skipped }).Count
+        $missing = ($results | Where-Object { $_.Status -eq 'Missing' }).Count
+        $unknown = ($results | Where-Object { $_.Status -eq 'UnknownType' -or $_.Status -eq 'ModeUndetected' }).Count
+
+        Write-Host ""
+        Write-Host "===== Bulk-PlaceDefinitions Summary ====="
+        Write-Host "Total files:        $total"
+        Write-Host "Placed:             $placed"
+        Write-Host "Dry-run only:       $dry"
+        Write-Host "Skipped:            $skipped"
+        Write-Host "Missing:            $missing"
+        Write-Host "Unknown type/mode:  $unknown"
+
+        Write-Log "Summary: Total=$total Placed=$placed DryRun=$dry Skipped=$skipped Missing=$missing Unknown=$unknown"
+
+        # Optional: dependency aggregation
+        $allDeps = $results |
+            Where-Object { $_.Dependencies -and $_.Dependencies.Count -gt 0 } |
+            ForEach-Object { $_.Dependencies } |
+            Sort-Object -Unique
+
+        if ($allDeps) {
+            Write-Host ""
+            Write-Host "Referenced dependencies (unique):"
+            $allDeps | ForEach-Object { Write-Host " - $_" }
+        }
+
+        return $results
+    }
+
+    return $results
 }
 
 # ------------------------------------------------------------
@@ -158,10 +336,10 @@ function Validate-DefinitionPack {
 
     try {
         [xml]$xml = Get-Content $XmlPath -Raw
-        Write-Host "✔ XML is well-formed."
+        Write-Host "OK: XML is well-formed."
     }
     catch {
-        Write-Host "❌ XML is NOT well-formed."
+        Write-Host "ERROR: XML is NOT well-formed."
         return
     }
 
@@ -182,11 +360,16 @@ function Version-DefinitionPack {
     )
 
     $Type = Detect-DefinitionType $XmlPath
-    $Mode = Detect-DefinitionMode $XmlPath
-    if (-not $Mode) { $Mode = "standard" }
+    $Mode = $null
 
     $Base = Join-Path $PSScriptRoot "..\..\definitions"
-    $VersionDir = Join-Path $Base "$Type\$Mode\$Version"
+    if ($Type -eq 'dyno') {
+        $VersionDir = Join-Path (Join-Path $Base $Type) $Version
+    } else {
+        $Mode = Detect-DefinitionMode $XmlPath
+        if (-not $Mode) { $Mode = "standard" }
+        $VersionDir = Join-Path $Base "$Type\$Mode\$Version"
+    }
 
     if (!(Test-Path $VersionDir)) {
         New-Item -ItemType Directory -Path $VersionDir -Force | Out-Null
@@ -197,11 +380,11 @@ function Version-DefinitionPack {
 
     Write-Host "Versioned pack stored at:"
     Write-Host "  $Dest"
-    Write-Log "Versioned $XmlPath → $Dest"
+    Write-Log "Versioned $XmlPath -> $Dest"
 }
 
 # ------------------------------------------------------------
-# Update-Tools Module
+# Update-RomRaiderToolsModule
 # ------------------------------------------------------------
 function Update-RomRaiderToolsModule {
     [CmdletBinding()]
@@ -229,13 +412,13 @@ function Update-RomRaiderToolsModule {
         Copy-Item $tmp $modulePath -Force
         Remove-Item $tmp -Force
 
-        Write-Host "✔ Module updated."
+        Write-Host "OK: Module updated."
         Write-Host "Backup:"
         Write-Host "  $backupPath"
         Write-Log "Module updated from $SourceUrl"
     }
     catch {
-        Write-Host "❌ Update failed: $($_.Exception.Message)"
+        Write-Host "ERROR: Update failed: $($_.Exception.Message)"
         Write-Log "Module update FAILED: $($_.Exception.Message)"
     }
 }
@@ -243,7 +426,6 @@ function Update-RomRaiderToolsModule {
 # ------------------------------------------------------------
 # Sync-DefinitionRepo
 # ------------------------------------------------------------
-
 function Sync-DefinitionRepo {
     [CmdletBinding()]
     param(
@@ -256,10 +438,14 @@ function Sync-DefinitionRepo {
 
     $BaseDefs = Join-Path $PSScriptRoot "..\..\definitions"
     $RepoRoot = Join-Path $BaseDefs "_repos"
-    if (!(Test-Path $RepoRoot)) { New-Item -ItemType Directory -Path $RepoRoot | Out-Null }
+    if (!(Test-Path $RepoRoot)) {
+        New-Item -ItemType Directory -Path $RepoRoot | Out-Null
+    }
 
     $TargetDir = Join-Path $RepoRoot $Name
-    if (!(Test-Path $TargetDir)) { New-Item -ItemType Directory -Path $TargetDir | Out-Null }
+    if (!(Test-Path $TargetDir)) {
+        New-Item -ItemType Directory -Path $TargetDir | Out-Null
+    }
 
     $tmpZip = New-TemporaryFile
     Write-Host "Downloading repo zip:"
@@ -281,28 +467,38 @@ function Sync-DefinitionRepo {
 
     Remove-Item $tmpExtract -Recurse -Force
 
-    Write-Host "✔ Repo synced to:"
+    Write-Host "OK: Repo synced to:"
     Write-Host "  $TargetDir"
-    Write-Log "Repo synced: $ZipUrl → $TargetDir"
+    Write-Log "Repo synced: $ZipUrl -> $TargetDir"
 }
 
-
 # ------------------------------------------------------------
-#  Get-DefinitionDependencyMap
+# Get-DefinitionDependencyMap
 # ------------------------------------------------------------
 function Get-DefinitionDependencyMap {
     [CmdletBinding()]
     param(
-        [string]$Root = $(Join-Path $PSScriptRoot "..\..\definitions")
+        [string]$Root = $(Join-Path $PSScriptRoot "..\..\definitions"),
+        [string]$Path
     )
 
-    if (-not (Test-Path $Root)) {
-        Write-Host "Root not found: $Root"
-        return
+    $files = @()
+
+    if ($Path) {
+        if (-not (Test-Path $Path)) {
+            Write-Host "File not found for dependency map: $Path"
+            return @()
+        }
+        $files = ,(Get-Item $Path)
+    } else {
+        if (-not (Test-Path $Root)) {
+            Write-Host "Root not found: $Root"
+            return @()
+        }
+        $files = Get-ChildItem -Path $Root -Filter *.xml -Recurse
     }
 
-    $files = Get-ChildItem -Path $Root -Filter *.xml -Recurse
-    $deps  = @()
+    $deps = @()
 
     foreach ($f in $files) {
         try {
@@ -321,8 +517,8 @@ function Get-DefinitionDependencyMap {
             foreach ($g in $m.Matches.Groups) {
                 if ($g.Name -eq "1" -and $g.Value) {
                     $deps += [pscustomobject]@{
-                        File       = $f.FullName
-                        DependsOn  = $g.Value
+                        File      = $f.FullName
+                        DependsOn = $g.Value
                     }
                 }
             }
